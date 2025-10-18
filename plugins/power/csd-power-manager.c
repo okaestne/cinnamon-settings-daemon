@@ -168,7 +168,7 @@ struct CsdPowerManagerPrivate
         gboolean                 notify_mouse;
         gboolean                 notify_other_devices;
         gint                     pre_dim_brightness; /* level, not percentage */
-        UpDevice                *device_composite;
+        UpDevice                *display_device;
         NotifyNotification      *notification_discharging;
         NotifyNotification      *notification_low;
         ca_context              *canberra_context;
@@ -200,10 +200,7 @@ enum {
 
 static void     csd_power_manager_finalize    (GObject              *object);
 
-static UpDevice *engine_get_composite_device (CsdPowerManager *manager, UpDevice *original_device);
-static UpDevice *engine_update_composite_device (CsdPowerManager *manager, UpDevice *original_device);
 static GIcon    *engine_get_icon (CsdPowerManager *manager);
-static UpDevice *engine_get_primary_device (CsdPowerManager *manager);
 static void      engine_charge_low (CsdPowerManager *manager, UpDevice *device);
 static void      engine_charge_critical (CsdPowerManager *manager, UpDevice *device);
 static void      engine_charge_action (CsdPowerManager *manager, UpDevice *device);
@@ -242,13 +239,7 @@ csd_power_manager_error_quark (void)
 static gboolean
 system_on_battery (CsdPowerManager *manager)
 {
-    UpDevice *primary;
-
-    // this will only return a device if it's the battery, it's present,
-    // and discharging.
-    primary = engine_get_primary_device (manager);
-
-    return primary != NULL;
+	return manager->priv->on_battery;
 }
 
 static gboolean
@@ -545,107 +536,23 @@ engine_get_warning (CsdPowerManager *manager, UpDevice *device)
 }
 
 static GIcon *
-engine_get_icon_priv (CsdPowerManager *manager,
-                      UpDeviceKind device_kind,
-                      CsdPowerManagerWarning warning,
-                      gboolean use_state)
-{
-        guint i;
-        GPtrArray *array;
-        UpDevice *device;
-        CsdPowerManagerWarning warning_temp;
-        UpDeviceKind kind;
-        UpDeviceState state;
-        gboolean is_present;
-
-        /* do we have specific device types? */
-        array = manager->priv->devices_array;
-        for (i=0;i<array->len;i++) {
-                device = g_ptr_array_index (array, i);
-
-                /* get device properties */
-                g_object_get (device,
-                              "kind", &kind,
-                              "state", &state,
-                              "is-present", &is_present,
-                              NULL);
-
-                /* if battery then use composite device to cope with multiple batteries */
-                if (kind == UP_DEVICE_KIND_BATTERY)
-                        device = engine_get_composite_device (manager, device);
-
-                warning_temp = GPOINTER_TO_INT(g_object_get_data (G_OBJECT(device),
-                                                                  "engine-warning-old"));
-                if (kind == device_kind && is_present) {
-                        if (warning != WARNING_NONE) {
-                                if (warning_temp == warning)
-                                        return gpm_upower_get_device_icon (device, TRUE);
-                                continue;
-                        }
-                        if (use_state) {
-                                if (state == UP_DEVICE_STATE_CHARGING ||
-                                    state == UP_DEVICE_STATE_DISCHARGING)
-                                        return gpm_upower_get_device_icon (device, TRUE);
-                                continue;
-                        }
-                        return gpm_upower_get_device_icon (device, TRUE);
-                }
-        }
-        return NULL;
-}
-
-static GIcon *
 engine_get_icon (CsdPowerManager *manager)
 {
-        GIcon *icon = NULL;
+        GIcon* icon = NULL;
+        gboolean is_present;
+        g_autofree gchar* icon_name = NULL;
 
+        g_object_get (manager->priv->display_device,
+                      "is-present", &is_present,
+                      "icon-name", &icon_name,
+                      NULL);
 
-        /* we try CRITICAL: BATTERY, UPS, MOUSE, KEYBOARD */
-        icon = engine_get_icon_priv (manager, UP_DEVICE_KIND_BATTERY, WARNING_CRITICAL, FALSE);
-        if (icon != NULL)
-                return icon;
-        icon = engine_get_icon_priv (manager, UP_DEVICE_KIND_UPS, WARNING_CRITICAL, FALSE);
-        if (icon != NULL)
-                return icon;
-        icon = engine_get_icon_priv (manager, UP_DEVICE_KIND_MOUSE, WARNING_CRITICAL, FALSE);
-        if (icon != NULL)
-                return icon;
-        icon = engine_get_icon_priv (manager, UP_DEVICE_KIND_KEYBOARD, WARNING_CRITICAL, FALSE);
-        if (icon != NULL)
-                return icon;
+        /* is-present on the display device: "Whether a status icon using this information should be presented." */
+        if (is_present && icon_name != NULL) {
+                icon = g_themed_icon_new(icon_name);
+        }
 
-        /* we try CRITICAL: BATTERY, UPS, MOUSE, KEYBOARD */
-        icon = engine_get_icon_priv (manager, UP_DEVICE_KIND_BATTERY, WARNING_LOW, FALSE);
-        if (icon != NULL)
-                return icon;
-        icon = engine_get_icon_priv (manager, UP_DEVICE_KIND_UPS, WARNING_LOW, FALSE);
-        if (icon != NULL)
-                return icon;
-        icon = engine_get_icon_priv (manager, UP_DEVICE_KIND_MOUSE, WARNING_LOW, FALSE);
-        if (icon != NULL)
-                return icon;
-        icon = engine_get_icon_priv (manager, UP_DEVICE_KIND_KEYBOARD, WARNING_LOW, FALSE);
-        if (icon != NULL)
-                return icon;
-
-        /* we try (DIS)CHARGING: BATTERY, UPS */
-        icon = engine_get_icon_priv (manager, UP_DEVICE_KIND_BATTERY, WARNING_NONE, TRUE);
-        if (icon != NULL)
-                return icon;
-        icon = engine_get_icon_priv (manager, UP_DEVICE_KIND_UPS, WARNING_NONE, TRUE);
-        if (icon != NULL)
-                return icon;
-
-        /* we try PRESENT: BATTERY, UPS */
-        icon = engine_get_icon_priv (manager, UP_DEVICE_KIND_BATTERY, WARNING_NONE, FALSE);
-        if (icon != NULL)
-                return icon;
-        icon = engine_get_icon_priv (manager, UP_DEVICE_KIND_UPS, WARNING_NONE, FALSE);
-        if (icon != NULL)
-                return icon;
-
-        /* do not show an icon */
-        return NULL;
+        return icon;
 }
 
 static gboolean
@@ -697,156 +604,6 @@ engine_recalculate_state (CsdPowerManager *manager)
                 engine_emit_changed (manager, icon_changed);
 }
 
-static UpDevice *
-engine_get_composite_device (CsdPowerManager *manager,
-                             UpDevice *original_device)
-{
-        guint battery_devices = 0;
-        GPtrArray *array;
-        UpDevice *device;
-        UpDeviceKind kind;
-        UpDeviceKind original_kind;
-        guint i;
-
-        /* get the type of the original device */
-        g_object_get (original_device,
-                      "kind", &original_kind,
-                      NULL);
-
-        /* find out how many batteries in the system */
-        array = manager->priv->devices_array;
-        for (i=0;i<array->len;i++) {
-                device = g_ptr_array_index (array, i);
-                g_object_get (device,
-                              "kind", &kind,
-                              NULL);
-                if (kind == original_kind)
-                        battery_devices++;
-        }
-
-        /* just use the original device if only one primary battery */
-        if (battery_devices <= 1) {
-                g_debug ("using original device as only one primary battery");
-                device = original_device;
-                goto out;
-        }
-
-        /* use the composite device */
-        device = manager->priv->device_composite;
-out:
-        /* return composite device or original device */
-        return device;
-}
-
-static UpDevice *
-engine_update_composite_device (CsdPowerManager *manager,
-                                UpDevice *original_device)
-{
-        guint i;
-        gdouble percentage = 0.0;
-        gdouble energy = 0.0;
-        gdouble energy_full = 0.0;
-        gdouble energy_rate = 0.0;
-        gdouble energy_total = 0.0;
-        gdouble energy_full_total = 0.0;
-        gdouble energy_rate_total = 0.0;
-        gint64 time_to_empty = 0;
-        gint64 time_to_full = 0;
-        guint battery_devices = 0;
-        gboolean is_charging = FALSE;
-        gboolean is_discharging = FALSE;
-        gboolean is_fully_charged = TRUE;
-        GPtrArray *array;
-        UpDevice *device;
-        UpDeviceState state;
-        UpDeviceKind kind;
-        UpDeviceKind original_kind;
-
-        /* get the type of the original device */
-        g_object_get (original_device,
-                      "kind", &original_kind,
-                      NULL);
-
-        /* update the composite device */
-        array = manager->priv->devices_array;
-        for (i=0;i<array->len;i++) {
-                device = g_ptr_array_index (array, i);
-                g_object_get (device,
-                              "kind", &kind,
-                              "state", &state,
-                              "energy", &energy,
-                              "energy-full", &energy_full,
-                              "energy-rate", &energy_rate,
-                              NULL);
-                if (kind != original_kind)
-                        continue;
-
-                /* one of these will be charging or discharging */
-                if (state == UP_DEVICE_STATE_CHARGING)
-                        is_charging = TRUE;
-                if (state == UP_DEVICE_STATE_DISCHARGING)
-                        is_discharging = TRUE;
-                if (state != UP_DEVICE_STATE_FULLY_CHARGED)
-                        is_fully_charged = FALSE;
-
-                /* sum up composite */
-                energy_total += energy;
-                energy_full_total += energy_full;
-                energy_rate_total += energy_rate;
-                battery_devices++;
-        }
-
-        /* just use the original device if only one primary battery */
-        if (battery_devices == 1) {
-                g_debug ("using original device as only one primary battery");
-                device = original_device;
-                goto out;
-        }
-
-        /* use percentage weighted for each battery capacity */
-        if (energy_full_total > 0.0)
-                percentage = 100.0 * energy_total / energy_full_total;
-
-        /* set composite state */
-        if (is_charging)
-                state = UP_DEVICE_STATE_CHARGING;
-        else if (is_discharging)
-                state = UP_DEVICE_STATE_DISCHARGING;
-        else if (is_fully_charged)
-                state = UP_DEVICE_STATE_FULLY_CHARGED;
-        else
-                state = UP_DEVICE_STATE_UNKNOWN;
-
-        /* calculate a quick and dirty time remaining value */
-        if (energy_rate_total > 0) {
-                if (state == UP_DEVICE_STATE_DISCHARGING)
-                        time_to_empty = 3600 * (energy_total / energy_rate_total);
-                else if (state == UP_DEVICE_STATE_CHARGING)
-                        time_to_full = 3600 * ((energy_full_total - energy_total) / energy_rate_total);
-        }
-
-        /* okay, we can use the composite device */
-        device = manager->priv->device_composite;
-
-        g_debug ("printing composite device");
-        g_object_set (device,
-                      "energy", energy,
-                      "energy-full", energy_full,
-                      "energy-rate", energy_rate,
-                      "time-to-empty", time_to_empty,
-                      "time-to-full", time_to_full,
-                      "percentage", percentage,
-                      "state", state,
-                      NULL);
-
-out:
-        /* force update of icon */
-	engine_recalculate_state (manager);
-	
-        /* return composite device or original device */
-        return device;
-}
-
 static void
 engine_device_add (CsdPowerManager *manager, UpDevice *device)
 {
@@ -880,10 +637,8 @@ engine_device_add (CsdPowerManager *manager, UpDevice *device)
                           G_CALLBACK (device_properties_changed_cb), manager);
 
         if (kind == UP_DEVICE_KIND_BATTERY) {
-                g_debug ("updating because we added a device");
-                composite = engine_update_composite_device (manager, device);
-
                 /* get the same values for the composite device */
+                composite = manager->priv->display_device;
                 warning = engine_get_warning (manager, composite);
 
                 if (warning == WARNING_LOW) {
@@ -1602,16 +1357,6 @@ device_properties_changed_cb (UpDevice *device, GParamSpec *pspec, CsdPowerManag
         /* get device properties */
         g_object_get (device,
                       "kind", &kind,
-                      NULL);
-
-        /* if battery then use composite device to cope with multiple batteries */
-        if (kind == UP_DEVICE_KIND_BATTERY) {
-                g_debug ("updating because %s changed", up_device_get_object_path (device));
-                device = engine_update_composite_device (manager, device);
-        }
-
-        /* get device properties (may be composite) */
-        g_object_get (device,
                       "state", &state,
                       NULL);
 
@@ -1664,45 +1409,6 @@ refresh_notification_settings (CsdPowerManager *manager)
                                                                       "power-notifications-for-mouse");
         manager->priv->notify_other_devices = g_settings_get_boolean (manager->priv->settings,
                                                                       "power-notifications-for-other-devices");
-}
-
-static UpDevice *
-engine_get_primary_device (CsdPowerManager *manager)
-{
-        guint i;
-        UpDevice *device = NULL;
-        UpDevice *device_tmp;
-        UpDeviceKind kind;
-        UpDeviceState state;
-        gboolean is_present;
-
-        for (i=0; i<manager->priv->devices_array->len; i++) {
-                device_tmp = g_ptr_array_index (manager->priv->devices_array, i);
-
-                /* get device properties */
-                g_object_get (device_tmp,
-                              "kind", &kind,
-                              "state", &state,
-                              "is-present", &is_present,
-                              NULL);
-
-                /* not present */
-                if (!is_present)
-                        continue;
-
-                /* not discharging */
-                if (state != UP_DEVICE_STATE_DISCHARGING)
-                        continue;
-
-                /* not battery */
-                if (kind != UP_DEVICE_KIND_BATTERY)
-                        continue;
-
-                /* use composite device to cope with multiple batteries */
-                device = g_object_ref (engine_get_composite_device (manager, device_tmp));
-                break;
-        }
-        return device;
 }
 
 static void
@@ -4047,6 +3753,8 @@ on_rr_screen_acquired (GObject      *object,
         manager->priv->up_client = up_client_new ();
         manager->priv->lid_is_closed = up_client_get_lid_is_closed (manager->priv->up_client);
         manager->priv->on_battery = up_client_get_on_battery(manager->priv->up_client);
+	/* virtual composite battery */
+        manager->priv->display_device = up_client_get_display_device (manager->priv->up_client);
         g_signal_connect (manager->priv->up_client, "device-added",
                           G_CALLBACK (engine_device_added_cb), manager);
         g_signal_connect (manager->priv->up_client, "device-removed",
@@ -4101,16 +3809,6 @@ on_rr_screen_acquired (GObject      *object,
                           G_CALLBACK (phone_device_removed_cb), manager);
         g_signal_connect (manager->priv->phone, "device-refresh",
                           G_CALLBACK (phone_device_refresh_cb), manager);
-
-        /* create a fake virtual composite battery */
-        manager->priv->device_composite = up_device_new ();
-        g_object_set (manager->priv->device_composite,
-                      "kind", UP_DEVICE_KIND_BATTERY,
-                      "is-rechargeable", TRUE,
-                      "native-path", "dummy:composite_battery",
-                      "power-supply", TRUE,
-                      "is-present", TRUE,
-                      NULL);
 
         /* get backlight setting overrides */
         manager->priv->backlight_helper_preference_args = NULL;
@@ -4300,10 +3998,7 @@ csd_power_manager_stop (CsdPowerManager *manager)
                 manager->priv->phone = NULL;
         }
 
-        if (manager->priv->device_composite != NULL) {
-                g_object_unref (manager->priv->device_composite);
-                manager->priv->device_composite = NULL;
-        }
+	g_clear_object (&manager->priv->display_device);
 
         if (manager->priv->previous_icon != NULL) {
                 g_object_unref (manager->priv->previous_icon);
@@ -4652,8 +4347,8 @@ power_iface_handle_get_primary_device (CsdPower              *object,
 
         g_debug ("Handling Power interface method GetPrimaryDevice");
 
-        /* get the virtual device */
-        device = engine_get_primary_device (manager);
+        /* get the virtual display device */
+        device = manager->priv->display_device;
         if (device == NULL) {
                 g_dbus_method_invocation_return_dbus_error (invocation,
                                                             "org.cinnamon.SettingsDaemon.Power.Failed",
@@ -4665,7 +4360,6 @@ power_iface_handle_get_primary_device (CsdPower              *object,
         value = device_to_variant_blob (device);
         tuple = g_variant_new_tuple (&value, 1);
         g_dbus_method_invocation_return_value (invocation, tuple);
-        g_object_unref (device);
 
         return TRUE;
 }
